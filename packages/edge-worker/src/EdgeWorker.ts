@@ -64,6 +64,7 @@ import {
 	LinearIssueTrackerService,
 	type LinearOAuthConfig,
 } from "cyrus-linear-event-transport";
+import { OpenCodeRunner } from "cyrus-opencode-runner";
 import { fileTypeFromBuffer } from "file-type";
 import { AgentSessionManager } from "./AgentSessionManager.js";
 import { AskUserQuestionHandler } from "./AskUserQuestionHandler.js";
@@ -1892,7 +1893,9 @@ export class EdgeWorker extends EventEmitter {
 			const runner =
 				runnerType === "claude"
 					? new ClaudeRunner(runnerConfig)
-					: new GeminiRunner(runnerConfig);
+					: runnerType === "gemini"
+						? new GeminiRunner(runnerConfig)
+						: new OpenCodeRunner(runnerConfig);
 
 			// Store runner by comment ID
 			agentSessionManager.addAgentRunner(linearAgentActivitySessionId, runner);
@@ -2514,7 +2517,7 @@ export class EdgeWorker extends EventEmitter {
 	 * If no runner label is found, defaults to claude.
 	 */
 	private determineRunnerFromLabels(labels: string[]): {
-		runnerType: "claude" | "gemini";
+		runnerType: "claude" | "gemini" | "opencode";
 		modelOverride?: string;
 		fallbackModelOverride?: string;
 	} {
@@ -2528,7 +2531,22 @@ export class EdgeWorker extends EventEmitter {
 
 		const lowercaseLabels = labels.map((label) => label.toLowerCase());
 
-		// Check for Gemini labels first
+		// Check for OpenCode labels first (Groq-powered)
+		if (
+			lowercaseLabels.includes("opencode") ||
+			lowercaseLabels.includes("groq") ||
+			lowercaseLabels.includes("llama")
+		) {
+			// OpenCode uses its own config for model selection
+			// The model is determined by opencode.json configuration
+			return {
+				runnerType: "opencode",
+				modelOverride: undefined, // OpenCode uses its own config
+				fallbackModelOverride: undefined,
+			};
+		}
+
+		// Check for Gemini labels
 		if (
 			lowercaseLabels.includes("gemini-2.5-pro") ||
 			lowercaseLabels.includes("gemini-2.5")
@@ -4742,7 +4760,10 @@ ${input.userComment}
 		labels?: string[],
 		maxTurns?: number,
 		singleTurn?: boolean,
-	): { config: AgentRunnerConfig; runnerType: "claude" | "gemini" } {
+	): {
+		config: AgentRunnerConfig;
+		runnerType: "claude" | "gemini" | "opencode";
+	} {
 		// Configure PostToolUse hook for playwright screenshots
 		const hooks: Partial<Record<HookEvent, HookCallbackMatcher[]>> = {
 			PostToolUse: [
@@ -5758,7 +5779,9 @@ ${input.userComment}
 		const runner =
 			runnerType === "claude"
 				? new ClaudeRunner(runnerConfig)
-				: new GeminiRunner(runnerConfig);
+				: runnerType === "gemini"
+					? new GeminiRunner(runnerConfig)
+					: new OpenCodeRunner(runnerConfig);
 
 		// Store runner
 		agentSessionManager.addAgentRunner(linearAgentActivitySessionId, runner);
