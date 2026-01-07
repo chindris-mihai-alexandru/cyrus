@@ -72,6 +72,22 @@ export class SharedApplicationServer {
 		this.app = Fastify({
 			logger: false,
 		});
+
+		// Add custom content type parser to capture raw body for webhook signature verification
+		this.app.addContentTypeParser(
+			"application/json",
+			{ parseAs: "buffer" },
+			(req, body, done) => {
+				// Store raw body on request for signature verification
+				(req as any).rawBody = body;
+				try {
+					const json = JSON.parse(body.toString());
+					done(null, json);
+				} catch (err) {
+					done(err as Error, undefined);
+				}
+			},
+		);
 	}
 
 	/**

@@ -103,7 +103,12 @@ export class LinearEventTransport
 
 		try {
 			// Verify the webhook signature using Linear's client
-			const bodyBuffer = Buffer.from(JSON.stringify(request.body));
+			// Use raw body if available (captured by Fastify content type parser), otherwise fallback to re-serializing
+			const rawBody = (request as any).rawBody;
+			const bodyBuffer =
+				rawBody instanceof Buffer
+					? rawBody
+					: Buffer.from(JSON.stringify(request.body));
 			const isValid = this.linearWebhookClient.verify(bodyBuffer, signature);
 
 			if (!isValid) {
