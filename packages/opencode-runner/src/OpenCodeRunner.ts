@@ -70,7 +70,7 @@ export class OpenCodeRunner extends EventEmitter implements IAgentRunner {
 	 * OpenCodeRunner supports streaming input via startStreaming(), addStreamMessage(), and completeStream()
 	 * when using server mode. CLI mode does not support streaming.
 	 */
-	readonly supportsStreamingInput = true;
+	readonly supportsStreamingInput: boolean;
 
 	private config: OpenCodeRunnerConfig;
 	private process: ChildProcess | null = null;
@@ -92,6 +92,8 @@ export class OpenCodeRunner extends EventEmitter implements IAgentRunner {
 		this.config = config;
 		this.cyrusHome = config.cyrusHome;
 		this.formatter = new OpenCodeMessageFormatter();
+		// Only support streaming in server mode
+		this.supportsStreamingInput = config.useServerMode ?? false;
 
 		// Forward config callbacks to events
 		if (config.onMessage) this.on("message", config.onMessage);
@@ -283,19 +285,21 @@ export class OpenCodeRunner extends EventEmitter implements IAgentRunner {
 		const opencodePath = this.config.opencodePath || "opencode";
 		const args: string[] = [];
 
-		// Add prompt flag
-		args.push("-p", prompt);
+		// Use 'run' subcommand with the prompt as positional argument
+		args.push("run");
 
-		// Add JSON output format for parsing
-		args.push("-f", "json");
+		// Add JSON output format for parsing (--format, not -f which is for files)
+		args.push("--format", "json");
 
-		// Add quiet mode (no spinner)
-		args.push("-q");
+		// Add the prompt as the message argument
+		args.push(prompt);
 
 		// Note: Model selection happens via opencode.json config or /model command
 		// We don't pass --model flag because opencode uses config-based model selection
 
-		console.log(`[OpenCodeRunner] Spawning: ${opencodePath} ${args.join(" ")}`);
+		console.log(
+			`[OpenCodeRunner] Spawning: ${opencodePath} run --format json "<prompt>"`,
+		);
 
 		this.process = spawn(opencodePath, args, {
 			cwd: this.config.workingDirectory,
@@ -316,15 +320,15 @@ export class OpenCodeRunner extends EventEmitter implements IAgentRunner {
 		this.process.stdout?.on("data", (data: Buffer) => {
 			const chunk = data.toString();
 			stdoutData += chunk;
-			if (this.config.debug) {
-				console.log("[OpenCodeRunner] stdout:", chunk);
-			}
+			// Always log stdout for debugging
+			console.log("[OpenCodeRunner] stdout:", chunk.substring(0, 500));
 		});
 
 		// Collect stderr
 		this.process.stderr?.on("data", (data: Buffer) => {
 			const chunk = data.toString();
 			stderrData += chunk;
+			// Always log stderr for debugging
 			console.error("[OpenCodeRunner] stderr:", chunk);
 		});
 
@@ -363,97 +367,172 @@ export class OpenCodeRunner extends EventEmitter implements IAgentRunner {
 	}
 
 	/**
-	 * Parse OpenCode JSON output and convert to SDK messages
+	 * Parse OpenCode NDJSON output and convert to SDK messages
+	 *
+	 * OpenCode with --format json outputs newline-delimited JSON (NDJSON),
+	 * where each line is a separate JSON event with a "type" field.
+	 *
+	 * Actual OpenCode event types:
+	 * - "step_start": Step begins, contains sessionID in event.sessionID
+	 * - "text": Text from assistant in event.part.text
+	 * - "tool_call": Tool being invoked
+	 * - "tool_result": Result from tool
+	 * - "step_finish": Step completed with stats in event.part.tokens
+	 * - "error": Error occurred
 	 */
 	private parseOpenCodeOutput(output: string): void {
-		try {
-			// OpenCode -f json outputs a JSON object with the response
-			const result = JSON.parse(output);
-
-			// Extract session ID if available
-			if (result.sessionId || result.session_id) {
-				this.sessionInfo!.sessionId = result.sessionId || result.session_id;
-				this.sessionInfo!.opencodeSessionId =
-					this.sessionInfo!.sessionId ?? undefined;
-			} else {
-				// Generate a session ID if not provided
-				this.sessionInfo!.sessionId = `opencode-${Date.now()}`;
-			}
-
-			// Convert to SDK message format
-			// The response field contains the assistant's response
-			const responseText =
-				result.response || result.content || result.text || "";
-
-			if (responseText) {
-				const assistantMessage: SDKAssistantMessage = {
-					type: "assistant",
-					message: {
-						role: "assistant",
-						content: [{ type: "text", text: responseText }],
-					},
-					session_id: this.sessionInfo!.sessionId!,
-				} as SDKAssistantMessage;
-
-				this.emitMessage(assistantMessage);
-
-				// Emit text event for compatibility
-				this.emit("text", responseText);
-				this.emit("assistant", responseText);
-			}
-
-			// Create result message
-			const resultMessage: SDKResultMessage = {
-				type: "result",
-				subtype: "success",
-				duration_ms: Date.now() - this.sessionInfo!.startedAt.getTime(),
-				duration_api_ms: result.stats?.duration || 0,
-				is_error: false,
-				num_turns: result.stats?.turns || 1,
-				result: responseText || "",
-				total_cost_usd: result.stats?.cost || 0,
-				usage: {
-					input_tokens: result.stats?.models?.input_tokens || 0,
-					output_tokens: result.stats?.models?.output_tokens || 0,
-					cache_creation_input_tokens: 0,
-					cache_read_input_tokens: 0,
-					cache_creation: {
-						ephemeral_1h_input_tokens: 0,
-						ephemeral_5m_input_tokens: 0,
-					},
-					server_tool_use: {
-						web_fetch_requests: 0,
-						web_search_requests: 0,
-					},
-					service_tier: "standard",
-				},
-				modelUsage: {},
-				permission_denials: [],
-				uuid: crypto.randomUUID() as `${string}-${string}-${string}-${string}-${string}`,
-				session_id: this.sessionInfo!.sessionId!,
-			};
-
-			this.pendingResultMessage = resultMessage;
-		} catch (error) {
-			console.error("[OpenCodeRunner] Failed to parse output:", error);
-			console.error("[OpenCodeRunner] Raw output:", output);
-
-			// If parsing fails, treat the output as plain text response
-			if (output.trim()) {
-				const assistantMessage: SDKAssistantMessage = {
-					type: "assistant",
-					message: {
-						role: "assistant",
-						content: [{ type: "text", text: output.trim() }],
-					},
-					session_id: this.sessionInfo?.sessionId || `opencode-${Date.now()}`,
-				} as SDKAssistantMessage;
-
-				this.emitMessage(assistantMessage);
-			}
-
-			throw error;
+		// Generate a session ID upfront in case we don't get one from OpenCode
+		if (!this.sessionInfo!.sessionId) {
+			this.sessionInfo!.sessionId = `opencode-${Date.now()}`;
 		}
+
+		// Split output into lines and parse each as JSON
+		const lines = output
+			.trim()
+			.split("\n")
+			.filter((line) => line.trim());
+
+		if (lines.length === 0) {
+			console.warn("[OpenCodeRunner] Empty output from OpenCode");
+			return;
+		}
+
+		console.log(`[OpenCodeRunner] Parsing ${lines.length} NDJSON lines`);
+
+		// Accumulate text content from streaming events
+		let accumulatedText = "";
+		let totalInputTokens = 0;
+		let totalOutputTokens = 0;
+		let totalCost = 0;
+
+		for (const line of lines) {
+			try {
+				const event = JSON.parse(line) as Record<string, unknown>;
+				const eventType = event.type as string;
+
+				console.log(`[OpenCodeRunner] Event: ${eventType}`);
+
+				switch (eventType) {
+					case "step_start":
+						// Step started - extract session ID from sessionID field
+						if (event.sessionID) {
+							this.sessionInfo!.sessionId = event.sessionID as string;
+							this.sessionInfo!.opencodeSessionId = event.sessionID as string;
+						}
+						break;
+
+					case "text": {
+						// Text from assistant - extract from part.text
+						const part = event.part as Record<string, unknown> | undefined;
+						if (part?.text) {
+							const text = part.text as string;
+							accumulatedText += text;
+							// Emit streaming text event
+							this.emit("text", text);
+						}
+						break;
+					}
+
+					case "tool_call": {
+						// Tool being called - extract tool name from part
+						const part = event.part as Record<string, unknown> | undefined;
+						const toolName = part?.name || part?.tool || "unknown";
+						console.log(`[OpenCodeRunner] Tool call: ${toolName}`);
+						break;
+					}
+
+					case "tool_result":
+						// Tool result - log for debugging
+						console.log(`[OpenCodeRunner] Tool result received`);
+						break;
+
+					case "step_finish": {
+						// Step completed - extract stats from part.tokens and part.cost
+						const part = event.part as Record<string, unknown> | undefined;
+						if (part) {
+							const tokens = part.tokens as Record<string, number> | undefined;
+							if (tokens) {
+								totalInputTokens += tokens.input || 0;
+								totalOutputTokens += tokens.output || 0;
+							}
+							if (typeof part.cost === "number") {
+								totalCost += part.cost;
+							}
+						}
+						break;
+					}
+
+					case "error": {
+						// Error occurred
+						const part = event.part as Record<string, unknown> | undefined;
+						const errorMsg = (part?.error ||
+							part?.message ||
+							event.error ||
+							"Unknown error") as string;
+						console.error(`[OpenCodeRunner] Error event: ${errorMsg}`);
+						break;
+					}
+
+					default:
+						// Unknown event type - log but continue
+						console.log(`[OpenCodeRunner] Unknown event type: ${eventType}`);
+				}
+			} catch (parseError) {
+				// Single line failed to parse - log and continue
+				console.warn(
+					`[OpenCodeRunner] Failed to parse line: ${line.substring(0, 100)}...`,
+					parseError,
+				);
+			}
+		}
+
+		// If we accumulated text, emit an assistant message
+		if (accumulatedText) {
+			const assistantMessage: SDKAssistantMessage = {
+				type: "assistant",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: accumulatedText }],
+				},
+				session_id: this.sessionInfo!.sessionId!,
+			} as SDKAssistantMessage;
+
+			this.emitMessage(assistantMessage);
+			this.emit("assistant", accumulatedText);
+		}
+
+		// Create result message using accumulated stats
+		const resultMessage: SDKResultMessage = {
+			type: "result",
+			subtype: "success",
+			duration_ms: Date.now() - this.sessionInfo!.startedAt.getTime(),
+			duration_api_ms: 0,
+			is_error: false,
+			num_turns: 1,
+			result: accumulatedText || "",
+			total_cost_usd: totalCost,
+			usage: {
+				input_tokens: totalInputTokens,
+				output_tokens: totalOutputTokens,
+				cache_creation_input_tokens: 0,
+				cache_read_input_tokens: 0,
+				cache_creation: {
+					ephemeral_1h_input_tokens: 0,
+					ephemeral_5m_input_tokens: 0,
+				},
+				server_tool_use: {
+					web_fetch_requests: 0,
+					web_search_requests: 0,
+				},
+				service_tier: "standard",
+			},
+			modelUsage: {},
+			permission_denials: [],
+			uuid: crypto.randomUUID() as `${string}-${string}-${string}-${string}-${string}`,
+			session_id: this.sessionInfo!.sessionId!,
+		};
+
+		this.pendingResultMessage = resultMessage;
 	}
 
 	/**

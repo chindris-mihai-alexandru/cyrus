@@ -2,8 +2,25 @@
  * OpenCode Runner Types
  *
  * Configuration and event types for the OpenCode runner, which enables
- * using OpenCode (with Groq, Gemini, or any configured provider) as the
- * backend for Cyrus Linear Agent.
+ * using OpenCode (with Groq, Gemini, OpenRouter, or any configured provider)
+ * as the backend for Cyrus Linear Agent.
+ *
+ * RECOMMENDED FREE MODELS FOR AGENTIC TASKS (Jan 2026):
+ *
+ * 1. OpenRouter (best free tier for coding):
+ *    - "openrouter/xiaomi/mimo-v2-flash:free" - SWE-bench #1 open source model
+ *    - "openrouter/mistralai/devstral-2512:free" - Agentic coding specialist
+ *    - "openrouter/qwen/qwen3-coder:free" - 480B MoE code model
+ *    Limits: 50 req/day (1000 with $10 lifetime topup)
+ *
+ * 2. Groq (fastest inference):
+ *    - "groq/llama-3.3-70b-versatile" - 1000 req/day
+ *
+ * 3. Cerebras (fastest inference, good limits):
+ *    - "cerebras/llama-3.3-70b" - 14,400 req/day
+ *
+ * Model selection happens via opencode.json, not CLI flags.
+ * Set the model in ~/.config/opencode/opencode.json or pass configPath.
  */
 
 import type {
@@ -22,7 +39,14 @@ export interface OpenCodeRunnerConfig extends AgentRunnerConfig {
 	opencodePath?: string;
 
 	/**
-	 * OpenCode model to use (e.g., "groq/llama-3.3-70b-versatile")
+	 * OpenCode model to use.
+	 *
+	 * Recommended FREE models for agentic/coding tasks:
+	 * - "openrouter/xiaomi/mimo-v2-flash:free" (best coding, SWE-bench #1)
+	 * - "openrouter/mistralai/devstral-2512:free" (agentic coding)
+	 * - "groq/llama-3.3-70b-versatile" (fast, 1000 req/day)
+	 * - "cerebras/llama-3.3-70b" (fastest, 14,400 req/day)
+	 *
 	 * If not specified, uses the default from opencode.json
 	 */
 	model?: string;
