@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
 import {
 	LinearWebhookClient,
@@ -102,14 +103,20 @@ export class LinearEventTransport
 		}
 
 		try {
-			// Verify the webhook signature using Linear's client
-			// Use raw body if available (captured by Fastify content type parser), otherwise fallback to re-serializing
-			const rawBody = (request as any).rawBody;
-			const bodyBuffer =
-				rawBody instanceof Buffer
-					? rawBody
-					: Buffer.from(JSON.stringify(request.body));
-			const isValid = this.linearWebhookClient.verify(bodyBuffer, signature);
+			// Verify the webhook signature manually using HMAC-SHA256
+			// The Linear SDK's verify() expects raw body bytes, but Fastify parses JSON before we can capture it.
+			// So we re-serialize the body and verify the signature manually.
+			// This works because Linear's signature is computed on the raw JSON body.
+			const bodyString = JSON.stringify(request.body);
+			const computedSignature = crypto
+				.createHmac("sha256", this.config.secret)
+				.update(bodyString)
+				.digest("hex");
+
+			const isValid = crypto.timingSafeEqual(
+				Buffer.from(signature),
+				Buffer.from(computedSignature),
+			);
 
 			if (!isValid) {
 				reply.code(401).send({ error: "Invalid webhook signature" });
